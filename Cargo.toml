@@ -1,0 +1,11 @@
+[package]
+name = "parakeet_test"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+parakeet-rs = "0.2"
+cpal = "0.15"
+hound = "3.5"
+anyhow = "1.0"
+rubato = "0.15"
