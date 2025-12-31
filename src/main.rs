@@ -279,6 +279,61 @@ fn stream_from_mic(duration_secs: u64) -> Result<()> {
     Ok(())
 }
 
+/// Apply high-pass filter to remove low-frequency noise
+fn high_pass_filter(samples: &mut [f32], sample_rate: u32, cutoff_freq: f32) {
+    // Simple first-order high-pass filter
+    let rc = 1.0 / (cutoff_freq * 2.0 * std::f32::consts::PI);
+    let dt = 1.0 / sample_rate as f32;
+    let alpha = rc / (rc + dt);
+
+    let mut prev_input = 0.0;
+    let mut prev_output = 0.0;
+
+    for sample in samples.iter_mut() {
+        let output = alpha * (prev_output + *sample - prev_input);
+        prev_input = *sample;
+        prev_output = output;
+        *sample = output;
+    }
+}
+
+/// Apply noise gate to suppress quiet sounds
+fn noise_gate(samples: &mut [f32], threshold: f32, reduction: f32) {
+    for sample in samples.iter_mut() {
+        if sample.abs() < threshold {
+            *sample *= reduction; // Reduce quiet sounds
+        }
+    }
+}
+
+/// Normalize audio volume
+fn normalize_audio(samples: &mut [f32], target_level: f32) {
+    // Find peak amplitude
+    let peak = samples.iter()
+        .map(|s| s.abs())
+        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .unwrap_or(0.0);
+
+    if peak > 0.001 {
+        let gain = (target_level / peak).min(3.0); // Limit gain to 3x to avoid over-amplification
+        for sample in samples.iter_mut() {
+            *sample *= gain;
+        }
+    }
+}
+
+/// Apply all audio post-processing
+fn process_audio(samples: &mut [f32], sample_rate: u32) {
+    // 1. High-pass filter at 80 Hz to remove low-frequency rumble
+    high_pass_filter(samples, sample_rate, 80.0);
+
+    // 2. Noise gate: suppress signals below -40dB (0.01 amplitude)
+    noise_gate(samples, 0.01, 0.1);
+
+    // 3. Normalize to a reasonable level (0.3 = -10dB)
+    normalize_audio(samples, 0.3);
+}
+
 fn stream_from_mic_realtime() -> Result<()> {
     println!("Real-time microphone streaming transcription");
     println!("Press Ctrl+C to stop\n");
@@ -365,10 +420,14 @@ fn stream_from_mic_realtime() -> Result<()> {
     stream.play()?;
     drop(tx); // Drop the original sender so the channel closes when stream ends
 
-    println!("Listening... (speak into your microphone)\n");
+    println!("Listening... (speak into your microphone)");
+    println!("Audio processing: High-pass filter (80Hz), Noise gate, Normalization\n");
 
     // Process audio chunks as they arrive
-    for chunk in rx {
+    for mut chunk in rx {
+        // Apply audio post-processing to reduce noise
+        process_audio(&mut chunk, sample_rate);
+
         // Resample to 16kHz mono if needed
         let resampled = if sample_rate != 16000 || channels > 1 {
             resample_to_16khz_mono(&chunk, sample_rate, channels)
