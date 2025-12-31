@@ -43,19 +43,22 @@ echo ""
 echo "1) End-of-Utterance (EOU) Model - For streaming speech recognition"
 echo "   Size: ~120MB"
 echo ""
-echo "2) Speaker Diarization Models - For identifying different speakers"
+echo "2) TDT Model (int8 quantized) - Multilingual with language detection"
+echo "   Size: ~710 MB (encoder, decoder, vocab)"
+echo ""
+echo "3) Speaker Diarization Models - For identifying different speakers"
 echo "   - v1: 514 MB"
 echo "   - v2: 492 MB (streaming)"
 echo "   - v2.1: 492 MB (streaming, latest)"
 echo ""
-echo "3) All models"
-echo "   Total: ~5.2 GB (includes TDT models)"
+echo "4) All models"
+echo "   Total: ~5.2 GB (includes all TDT models)"
 echo ""
-echo "4) Minimal setup (EOU + latest diarization)"
+echo "5) Minimal setup (EOU + latest diarization)"
 echo "   Size: ~612 MB"
 echo ""
 
-read -p "Enter your choice (1-4): " choice
+read -p "Enter your choice (1-5): " choice
 
 case $choice in
     1)
@@ -69,6 +72,28 @@ case $choice in
         ;;
 
     2)
+        echo ""
+        echo "Downloading TDT Model (int8 quantized)..."
+        echo "This multilingual model supports 25 languages with automatic detection."
+        mkdir -p "$MODEL_DIR/tdt"
+
+        download_file \
+            "$REPO_URL/tdt/encoder-model.int8.onnx" \
+            "$MODEL_DIR/tdt/encoder-model.onnx" \
+            "TDT Encoder (int8 quantized)"
+
+        download_file \
+            "$REPO_URL/tdt/decoder_joint-model.int8.onnx" \
+            "$MODEL_DIR/tdt/decoder_joint-model.onnx" \
+            "TDT Decoder/Joint (int8 quantized)"
+
+        download_file \
+            "$REPO_URL/tdt/vocab.txt" \
+            "$MODEL_DIR/tdt/vocab.txt" \
+            "TDT Vocabulary"
+        ;;
+
+    3)
         echo ""
         echo "Downloading Speaker Diarization models..."
 
@@ -100,7 +125,7 @@ case $choice in
         fi
         ;;
 
-    3)
+    4)
         echo ""
         echo "Downloading ALL models (this will take a while - 5.2 GB)..."
         echo ""
@@ -120,6 +145,23 @@ case $choice in
                     "$MODEL_DIR/realtime_eou_120m-v1-onnx/decoder_joint.onnx" \
                     "EOU Decoder Joint Model"
 
+                # TDT Model (int8)
+                mkdir -p "$MODEL_DIR/tdt"
+                download_file \
+                    "$REPO_URL/tdt/encoder-model.int8.onnx" \
+                    "$MODEL_DIR/tdt/encoder-model.onnx" \
+                    "TDT Encoder (int8 quantized)"
+
+                download_file \
+                    "$REPO_URL/tdt/decoder_joint-model.int8.onnx" \
+                    "$MODEL_DIR/tdt/decoder_joint-model.onnx" \
+                    "TDT Decoder/Joint (int8 quantized)"
+
+                download_file \
+                    "$REPO_URL/tdt/vocab.txt" \
+                    "$MODEL_DIR/tdt/vocab.txt" \
+                    "TDT Vocabulary"
+
                 # Diarization models
                 download_file \
                     "$REPO_URL/diar_sortformer_4spk-v1.onnx" \
@@ -137,8 +179,7 @@ case $choice in
                     "Diarization Streaming Sortformer v2.1"
 
                 echo ""
-                echo "Note: TDT models not downloaded individually."
-                echo "Install git-lfs and use option 3 again to get all models."
+                echo "All models downloaded successfully!"
             fi
         else
             echo "Download cancelled."
@@ -146,7 +187,7 @@ case $choice in
         fi
         ;;
 
-    4)
+    5)
         echo ""
         echo "Downloading minimal setup (EOU + latest diarization)..."
 

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use hound::{WavSpec, WavWriter};
-use parakeet_rs::ParakeetEOU;
+use parakeet_rs::{ParakeetEOU, ParakeetTDT, Transcriber};
 use rubato::Resampler;
 use std::env;
 use std::path::Path;
@@ -9,19 +9,58 @@ use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Instant;
 
+#[derive(Clone, Copy)]
+enum ModelType {
+    EOU,
+    TDT,
+}
+
+enum ParakeetModel {
+    EOU(ParakeetEOU),
+    TDT(ParakeetTDT),
+}
+
+impl ParakeetModel {
+    fn from_pretrained(model_type: ModelType, path: &str) -> Result<Self> {
+        match model_type {
+            ModelType::EOU => Ok(ParakeetModel::EOU(ParakeetEOU::from_pretrained(path, None)?)),
+            ModelType::TDT => Ok(ParakeetModel::TDT(ParakeetTDT::from_pretrained(path, None)?)),
+        }
+    }
+
+    fn transcribe(&mut self, samples: &[f32], is_final: bool) -> Result<String> {
+        match self {
+            ParakeetModel::EOU(model) => {
+                model.transcribe(samples, is_final).map_err(|e| anyhow::anyhow!("{}", e))
+            }
+            ParakeetModel::TDT(model) => {
+                // TDT doesn't support streaming with is_final flag, so we process each chunk
+                let result = model.transcribe_samples(samples.to_vec(), 16000, 1, None)
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                Ok(result.text)
+            }
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 2 {
         println!("Parakeet-RS Speech Recognition Test\n");
         println!("Usage:");
-        println!("  {} file <audio.wav>     - Transcribe audio file and measure speed", args[0]);
-        println!("  {} mic [duration_secs]  - Stream from microphone (default: 10 seconds)", args[0]);
-        println!("  {} mic_streaming        - Real-time streaming transcription from mic", args[0]);
+        println!("  {} file <audio.wav> [--model eou|tdt]     - Transcribe audio file", args[0]);
+        println!("  {} mic [duration_secs] [--model eou|tdt]  - Stream from microphone", args[0]);
+        println!("  {} mic_streaming [--model eou|tdt]        - Real-time streaming", args[0]);
+        println!("\nModel Options:");
+        println!("  --model eou  - Fast real-time model (default, English-focused)");
+        println!("  --model tdt  - Multilingual model with language detection (25 languages)");
         println!("\nNote: You need to download the model files from HuggingFace first!");
-        println!("      Place them in the current directory or specify path.");
+        println!("      Place them in ./models/realtime_eou_120m-v1-onnx/ or ./models/tdt/");
         return Ok(());
     }
+
+    let model_type = parse_model_type(&args);
 
     match args[1].as_str() {
         "file" => {
@@ -30,18 +69,18 @@ fn main() -> Result<()> {
                 println!("Usage: {} file <audio.wav>", args[0]);
                 return Ok(());
             }
-            transcribe_file(&args[2])?;
+            transcribe_file(&args[2], model_type)?;
         }
         "mic" => {
-            let duration = if args.len() >= 3 {
+            let duration = if args.len() >= 3 && !args[2].starts_with("--") {
                 args[2].parse::<u64>().unwrap_or(10)
             } else {
                 10
             };
-            stream_from_mic(duration)?;
+            stream_from_mic(duration, model_type)?;
         }
         "mic_streaming" => {
-            stream_from_mic_realtime()?;
+            stream_from_mic_realtime(model_type)?;
         }
         _ => {
             println!("Unknown command: {}", args[1]);
@@ -52,11 +91,39 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn get_model_path() -> &'static str {
-    if Path::new("./models").exists() {
-        "./models/realtime_eou_120m-v1-onnx/"
-    } else {
-        "."
+fn parse_model_type(args: &[String]) -> ModelType {
+    for i in 0..args.len() {
+        if args[i] == "--model" && i + 1 < args.len() {
+            match args[i + 1].as_str() {
+                "tdt" => return ModelType::TDT,
+                "eou" => return ModelType::EOU,
+                _ => {}
+            }
+        }
+    }
+    ModelType::EOU // Default to EOU
+}
+
+fn get_model_path(model_type: ModelType) -> &'static str {
+    match model_type {
+        ModelType::EOU => {
+            if Path::new("./models/realtime_eou_120m-v1-onnx").exists() {
+                "./models/realtime_eou_120m-v1-onnx/"
+            } else if Path::new("./models").exists() {
+                "./models/"
+            } else {
+                "."
+            }
+        }
+        ModelType::TDT => {
+            if Path::new("./models/tdt").exists() {
+                "./models/tdt/"
+            } else if Path::new("./tdt").exists() {
+                "./tdt/"
+            } else {
+                "."
+            }
+        }
     }
 }
 
@@ -91,59 +158,101 @@ fn prepare_audio_file(file_path: &str) -> Result<(String, bool)> {
     }
 }
 
-fn transcribe_file(file_path: &str) -> Result<()> {
-    let model_path = get_model_path();
-    println!("Loading Parakeet EOU model from: {}", model_path);
+fn transcribe_file(file_path: &str, model_type: ModelType) -> Result<()> {
+    let model_path = get_model_path(model_type);
+    let model_name = match model_type {
+        ModelType::EOU => "Parakeet EOU (English real-time)",
+        ModelType::TDT => "Parakeet TDT (Multilingual)",
+    };
+    println!("Loading {} model from: {}", model_name, model_path);
     let model_load_start = Instant::now();
 
-    let mut parakeet = ParakeetEOU::from_pretrained(model_path, None)?;
-
     let model_load_time = model_load_start.elapsed();
-    println!("Model loaded in {:.2}s\n", model_load_time.as_secs_f64());
 
-    let (audio_file, is_temp) = prepare_audio_file(file_path)?;
+    match model_type {
+        ModelType::TDT => {
+            // TDT model works best with complete files
+            let mut parakeet = ParakeetTDT::from_pretrained(model_path, None)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-    println!("Loading audio file: {}", audio_file);
-    let mut reader = hound::WavReader::open(&audio_file)?;
-    let spec = reader.spec();
+            println!("Model loaded in {:.2}s\n", model_load_time.as_secs_f64());
 
-    let samples: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Float => {
-            reader.samples::<f32>().map(|s| s.unwrap()).collect()
+            let (audio_file, is_temp) = prepare_audio_file(file_path)?;
+
+            println!("Transcribing audio file: {}", audio_file);
+            let transcribe_start = Instant::now();
+
+            let result = parakeet.transcribe_file(&audio_file, None)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            let transcribe_time = transcribe_start.elapsed();
+
+            println!("\n=== Results ===");
+            println!("Transcription: {}", result.text);
+            println!("\nProcessing time: {:.2}s", transcribe_time.as_secs_f64());
+
+            if is_temp {
+                // std::fs::remove_file(&audio_file).ok();
+            }
         }
-        hound::SampleFormat::Int => {
-            reader.samples::<i16>().map(|s| {
-                s.unwrap() as f32 / i16::MAX as f32
-            }).collect()
+        ModelType::EOU => {
+            // EOU model processes in streaming chunks
+            let mut parakeet = ParakeetEOU::from_pretrained(model_path, None)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            println!("Model loaded in {:.2}s\n", model_load_time.as_secs_f64());
+
+            let (audio_file, is_temp) = prepare_audio_file(file_path)?;
+
+            println!("Loading audio file: {}", audio_file);
+            let mut reader = hound::WavReader::open(&audio_file)?;
+            let spec = reader.spec();
+
+            let samples: Vec<f32> = match spec.sample_format {
+                hound::SampleFormat::Float => {
+                    reader.samples::<f32>().map(|s| s.unwrap()).collect()
+                }
+                hound::SampleFormat::Int => {
+                    reader.samples::<i16>().map(|s| {
+                        s.unwrap() as f32 / i16::MAX as f32
+                    }).collect()
+                }
+            };
+
+            println!("Transcribing {} samples in streaming chunks...", samples.len());
+            let transcribe_start = Instant::now();
+
+            const CHUNK_SIZE: usize = 2560;
+            let mut full_transcription = String::new();
+
+            for chunk in samples.chunks(CHUNK_SIZE) {
+                let text = parakeet.transcribe(chunk, false)
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                full_transcription.push_str(&text);
+            }
+
+            let transcribe_time = transcribe_start.elapsed();
+
+            println!("\n=== Results ===");
+            println!("Transcription: {}", full_transcription);
+            println!("\nProcessing time: {:.2}s", transcribe_time.as_secs_f64());
+
+            if is_temp {
+                // std::fs::remove_file(&audio_file).ok();
+            }
         }
-    };
-
-    println!("Transcribing {} samples in streaming chunks...", samples.len());
-    let transcribe_start = Instant::now();
-
-    const CHUNK_SIZE: usize = 2560;
-    let mut full_transcription = String::new();
-
-    for chunk in samples.chunks(CHUNK_SIZE) {
-        let text = parakeet.transcribe(chunk, false)?;
-        full_transcription.push_str(&text);
-    }
-
-    let transcribe_time = transcribe_start.elapsed();
-
-    println!("\n=== Results ===");
-    println!("Transcription: {}", full_transcription);
-    println!("\nProcessing time: {:.2}s", transcribe_time.as_secs_f64());
-
-    if is_temp {
-        // std::fs::remove_file(&audio_file).ok();
     }
 
     Ok(())
 }
 
-fn stream_from_mic(duration_secs: u64) -> Result<()> {
+fn stream_from_mic(duration_secs: u64, model_type: ModelType) -> Result<()> {
+    let model_name = match model_type {
+        ModelType::EOU => "EOU (English real-time)",
+        ModelType::TDT => "TDT (Multilingual)",
+    };
     println!("Streaming from microphone for {} seconds...", duration_secs);
+    println!("Using {} model", model_name);
     println!("Speak clearly into your microphone!\n");
 
     let host = cpal::default_host();
@@ -242,53 +351,89 @@ fn stream_from_mic(duration_secs: u64) -> Result<()> {
 
     println!("Saved temporary file: {}\n", temp_file);
 
-    let model_path = get_model_path();
-    println!("Loading Parakeet EOU model from: {}", model_path);
-
-    let mut parakeet = ParakeetEOU::from_pretrained(model_path, None)?;
-
-    println!("Transcribing recorded audio...");
-
-    let mut reader = hound::WavReader::open(temp_file)?;
-    let spec = reader.spec();
-
-    let samples: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Float => {
-            reader.samples::<f32>().map(|s| s.unwrap()).collect()
-        }
-        hound::SampleFormat::Int => {
-            reader.samples::<i16>().map(|s| {
-                s.unwrap() as f32 / i16::MAX as f32
-            }).collect()
-        }
+    let model_path = get_model_path(model_type);
+    let model_name = match model_type {
+        ModelType::EOU => "Parakeet EOU",
+        ModelType::TDT => "Parakeet TDT",
     };
+    println!("Loading {} model from: {}", model_name, model_path);
 
-    const CHUNK_SIZE: usize = 2560;
-    let mut full_transcription = String::new();
+    match model_type {
+        ModelType::TDT => {
+            // TDT model works best with complete files
+            let mut parakeet = ParakeetTDT::from_pretrained(model_path, None)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-    for chunk in samples.chunks(CHUNK_SIZE) {
-        let text = parakeet.transcribe(chunk, false)?;
-        full_transcription.push_str(&text);
+            println!("Transcribing recorded audio...");
+
+            let result = parakeet.transcribe_file(temp_file, None)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            println!("\n=== Transcription Result ===");
+            println!("{}", result.text);
+        }
+        ModelType::EOU => {
+            // EOU model processes in streaming chunks
+            let mut parakeet = ParakeetEOU::from_pretrained(model_path, None)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+            println!("Transcribing recorded audio...");
+
+            let mut reader = hound::WavReader::open(temp_file)?;
+            let spec = reader.spec();
+
+            let samples: Vec<f32> = match spec.sample_format {
+                hound::SampleFormat::Float => {
+                    reader.samples::<f32>().map(|s| s.unwrap()).collect()
+                }
+                hound::SampleFormat::Int => {
+                    reader.samples::<i16>().map(|s| {
+                        s.unwrap() as f32 / i16::MAX as f32
+                    }).collect()
+                }
+            };
+
+            const CHUNK_SIZE: usize = 2560;
+            let mut full_transcription = String::new();
+
+            for chunk in samples.chunks(CHUNK_SIZE) {
+                let text = parakeet.transcribe(chunk, false)
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                full_transcription.push_str(&text);
+            }
+
+            println!("\n=== Transcription Result ===");
+            println!("{}", full_transcription);
+        }
     }
-
-    println!("\n=== Transcription Result ===");
-    println!("{}", full_transcription);
 
     // std::fs::remove_file(temp_file).ok();
 
     Ok(())
 }
 
-fn stream_from_mic_realtime() -> Result<()> {
+fn stream_from_mic_realtime(model_type: ModelType) -> Result<()> {
+    let model_name = match model_type {
+        ModelType::EOU => "Parakeet EOU (English real-time)",
+        ModelType::TDT => "Parakeet TDT (Multilingual)",
+    };
     println!("Real-time microphone streaming transcription");
+    println!("Using {} model", model_name);
+
+    if matches!(model_type, ModelType::TDT) {
+        println!("\nWARNING: TDT model is not optimized for real-time streaming.");
+        println!("For best real-time performance, use --model eou");
+        println!("TDT will accumulate 5-second buffers before transcribing.\n");
+    }
+
     println!("Press Ctrl+C to stop\n");
 
     // Load model first
-    let model_path = get_model_path();
-    println!("Loading Parakeet EOU model from: {}", model_path);
+    let model_path = get_model_path(model_type);
+    println!("Loading model from: {}", model_path);
     let model_load_start = Instant::now();
 
-    let mut parakeet = ParakeetEOU::from_pretrained(model_path, None)?;
+    let mut parakeet = ParakeetModel::from_pretrained(model_type, model_path)?;
 
     let model_load_time = model_load_start.elapsed();
     println!("Model loaded in {:.2}s\n", model_load_time.as_secs_f64());
